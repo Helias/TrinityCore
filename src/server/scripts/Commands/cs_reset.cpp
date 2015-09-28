@@ -39,6 +39,8 @@ public:
     {
         static ChatCommand resetCommandTable[] =
         {
+            { "honorworld",   SEC_ADMINISTRATOR,  true, &HandleResetHonorWorldCommand,   "", NULL },
+            { "arenaworld",   SEC_ADMINISTRATOR,  true, &HandleResetArenaWorldCommand,   "", NULL },
             { "achievements", rbac::RBAC_PERM_COMMAND_RESET_ACHIEVEMENTS, true, &HandleResetAchievementsCommand, "", NULL },
             { "honor",        rbac::RBAC_PERM_COMMAND_RESET_HONOR,        true, &HandleResetHonorCommand,        "", NULL },
             { "level",        rbac::RBAC_PERM_COMMAND_RESET_LEVEL,        true, &HandleResetLevelCommand,        "", NULL },
@@ -55,6 +57,46 @@ public:
         };
         return commandTable;
     }
+  
+    static bool HandleResetArenaWorldCommand(ChatHandler * handler, const char * args)
+    {
+
+        SQLTransaction trans = CharacterDatabase.BeginTransaction();
+
+        trans->PAppend("UPDATE `characters` SET `arenaPoints`=%u", sWorld->getIntConfig(CONFIG_START_ARENA_POINTS));
+
+        std::string param = args;
+        if (*args && param == "delete")
+        {
+            trans->PAppend("TRUNCATE `arena_team`");
+            trans->PAppend("TRUNCATE `arena_team_member`");
+            trans->PAppend("TRUNCATE `character_arena_stats`");
+        }
+        else
+        {
+            trans->PAppend("UPDATE `arena_team` SET `rating`=%u,`seasonGames`=0,`seasonWins`=0,`weekGames`=0,`weekWins`=0,`rank`=0", sWorld->getIntConfig(CONFIG_ARENA_START_RATING));
+            trans->PAppend("UPDATE `arena_team_member` SET `personalRating`=%u,`weekGames`=0,`weekWins`=0,`seasonGames`=0,`seasonWins`=0", sWorld->getIntConfig(CONFIG_ARENA_START_PERSONAL_RATING));
+            trans->PAppend("UPDATE `character_arena_stats` SET `matchMakerRating`=%u", sWorld->getIntConfig(CONFIG_ARENA_START_MATCHMAKER_RATING));
+        }
+        CharacterDatabase.CommitTransaction(trans);
+
+        return true;
+    }
+
+    static bool HandleResetHonorWorldCommand(ChatHandler * handler, const char * args)
+    {
+        SQLTransaction trans = CharacterDatabase.BeginTransaction();
+        trans->PAppend("UPDATE `characters` SET `totalHonorPoints`=%u,`todayHonorPoints`=0,`yesterdayHonorPoints`=0", sWorld->getIntConfig(CONFIG_START_HONOR_POINTS));
+
+        std::string param = args;
+        if (*args && param == "kills")
+            trans->PAppend("UPDATE `characters` SET `totalKills`=0,`todayKills`=0,`yesterdayKills`=0");
+
+        CharacterDatabase.CommitTransaction(trans);
+
+        return true;
+    }
+
 
     static bool HandleResetAchievementsCommand(ChatHandler* handler, char const* args)
     {
@@ -66,7 +108,7 @@ public:
         if (target)
             target->ResetAchievements();
         else
-            AchievementMgr<Player>::DeleteFromDB(targetGuid);
+            AchievementMgr::DeleteFromDB(targetGuid);
 
         return true;
     }
@@ -77,8 +119,11 @@ public:
         if (!handler->extractPlayerTarget((char*)args, &target))
             return false;
 
+        target->SetHonorPoints(0);
         target->SetUInt32Value(PLAYER_FIELD_KILLS, 0);
         target->SetUInt32Value(PLAYER_FIELD_LIFETIME_HONORABLE_KILLS, 0);
+        target->SetUInt32Value(PLAYER_FIELD_TODAY_CONTRIBUTION, 0);
+        target->SetUInt32Value(PLAYER_FIELD_YESTERDAY_CONTRIBUTION, 0);
         target->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_EARN_HONORABLE_KILL);
 
         return true;
@@ -93,14 +138,15 @@ public:
             return false;
         }
 
-        uint8 powerType = classEntry->PowerType;
+        uint8 powerType = classEntry->powerType;
 
         // reset m_form if no aura
         if (!player->HasAuraType(SPELL_AURA_MOD_SHAPESHIFT))
             player->SetShapeshiftForm(FORM_NONE);
 
         player->setFactionForRace(player->getRace());
-        player->SetUInt32Value(UNIT_FIELD_DISPLAY_POWER, powerType);
+
+        player->SetUInt32Value(UNIT_FIELD_BYTES_0, ((player->getRace()) | (player->getClass() << 8) | (player->getGender() << 16) | (powerType << 24)));
 
         // reset only if player not in some form;
         if (player->GetShapeshiftForm() == FORM_NONE)
@@ -171,7 +217,7 @@ public:
         {
             PreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_UPD_ADD_AT_LOGIN_FLAG);
             stmt->setUInt16(0, uint16(AT_LOGIN_RESET_SPELLS));
-            stmt->setUInt64(1, targetGuid.GetCounter());
+            stmt->setUInt32(1, targetGuid.GetCounter());
             CharacterDatabase.Execute(stmt);
 
             handler->PSendSysMessage(LANG_RESET_SPELLS_OFFLINE, targetName.c_str());
@@ -203,10 +249,8 @@ public:
         Player* target;
         ObjectGuid targetGuid;
         std::string targetName;
-
         if (!handler->extractPlayerTarget((char*)args, &target, &targetGuid, &targetName))
         {
-            /* TODO: 6.x remove/update pet talents
             // Try reset talents as Hunter Pet
             Creature* creature = handler->getSelectedCreature();
             if (!*args && creature && creature->IsPet())
@@ -223,7 +267,6 @@ public:
                 }
                 return true;
             }
-            */
 
             handler->SendSysMessage(LANG_NO_CHAR_SELECTED);
             handler->SetSentErrorMessage(true);
@@ -233,25 +276,22 @@ public:
         if (target)
         {
             target->ResetTalents(true);
-            target->ResetTalentSpecialization();
-            target->SendTalentsInfoData();
+            target->SendTalentsInfoData(false);
             ChatHandler(target->GetSession()).SendSysMessage(LANG_RESET_TALENTS);
             if (!handler->GetSession() || handler->GetSession()->GetPlayer() != target)
                 handler->PSendSysMessage(LANG_RESET_TALENTS_ONLINE, handler->GetNameLink(target).c_str());
 
-            /* TODO: 6.x remove/update pet talents
             Pet* pet = target->GetPet();
             Pet::resetTalentsForAllPetsOf(target, pet);
             if (pet)
                 target->SendTalentsInfoData(true);
-            */
             return true;
         }
-        else if (!targetGuid.IsEmpty())
+        else if (targetGuid)
         {
             PreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_UPD_ADD_AT_LOGIN_FLAG);
             stmt->setUInt16(0, uint16(AT_LOGIN_NONE | AT_LOGIN_RESET_PET_TALENTS));
-            stmt->setUInt64(1, targetGuid.GetCounter());
+            stmt->setUInt32(1, targetGuid.GetCounter());
             CharacterDatabase.Execute(stmt);
 
             std::string nameLink = handler->playerLink(targetName);
